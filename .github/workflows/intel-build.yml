@@ -1,0 +1,155 @@
+name: Intel macOS Build (unofficial)
+
+# Builds an Intel (x86_64) macOS .dmg of LLM Wiki for a given upstream
+# tag and publishes it as a "<tag>-intel" release on THIS fork.
+#
+# Why this exists: upstream (nashsu/llm_wiki) ships no Intel macOS
+# artifact — its release matrix builds Apple Silicon (aarch64) only.
+# An Intel matrix entry was merged (PR #416) then dropped again in a
+# later feature commit, so Intel users remain unserved. This pipeline
+# fills the gap on GitHub's last Intel runner (macos-13), as a NATIVE
+# build (no cross-compile). GPLv3 redistribution of an unmodified
+# upstream tag — not an official release.
+#
+# Trigger manually: Actions -> Intel macOS Build -> Run workflow, enter
+# the upstream tag (e.g. v0.5.2). A daily schedule also auto-builds the
+# latest upstream tag if no "<tag>-intel" release exists yet.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream tag to build (e.g. v0.5.2)'
+        required: true
+        type: string
+  schedule:
+    # Daily 06:00 UTC — auto-build latest upstream tag if missing.
+    - cron: '0 6 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  resolve-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+      needed: ${{ steps.pick.outputs.needed }}
+    steps:
+      - name: Resolve target tag and whether a build is needed
+        id: pick
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG=$(gh release view --repo nashsu/llm_wiki --json tagName --jq .tagName)
+          fi
+          echo "Resolved upstream tag: $TAG"
+          # Skip if we already published <tag>-intel on this fork.
+          if gh release view "${TAG}-intel" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release ${TAG}-intel already exists — nothing to do."
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  build-intel:
+    needs: resolve-tag
+    if: needs.resolve-tag.outputs.needed == 'true'
+    runs-on: macos-13
+    env:
+      TAG: ${{ needs.resolve-tag.outputs.tag }}
+    steps:
+      - name: Checkout upstream tag
+        uses: actions/checkout@v4
+        with:
+          repository: nashsu/llm_wiki
+          ref: ${{ needs.resolve-tag.outputs.tag }}
+
+      - name: Install Rust stable (x86_64-apple-darwin)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Install protoc
+        run: brew install protobuf
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install frontend dependencies
+        run: npm install
+
+      - name: Prepare MCP server resources
+        run: |
+          npm --prefix mcp-server ci
+          npm run mcp:build
+
+      # The bundled libpdfium.dylib is arm64 (matches upstream's aarch64
+      # macOS build). Swap in the committed Intel binary so the x86_64
+      # .app links the correct PDFium, or PDF features crash at runtime.
+      - name: Use x86_64 PDFium binary
+        run: |
+          cp src-tauri/pdfium/libpdfium-x86_64.dylib src-tauri/pdfium/libpdfium.dylib
+          file src-tauri/pdfium/libpdfium.dylib
+
+      - name: Build Tauri app (Intel)
+        run: npx tauri build --target x86_64-apple-darwin
+
+      - name: Locate .dmg (fallback to hdiutil if bundler failed)
+        id: dmg
+        run: |
+          set -euo pipefail
+          BASE="src-tauri/target/x86_64-apple-darwin/release/bundle"
+          DMG=$(find "$BASE/dmg" -name '*.dmg' 2>/dev/null | head -1 || true)
+          if [ -z "$DMG" ]; then
+            echo "tauri DMG bundler produced nothing — building DMG manually."
+            APP=$(find "$BASE/macos" -name '*.app' -maxdepth 1 | head -1)
+            STAGE=$(mktemp -d)
+            cp -R "$APP" "$STAGE/"
+            ln -s /Applications "$STAGE/Applications"
+            mkdir -p "$BASE/dmg"
+            DMG="$BASE/dmg/LLM Wiki_${TAG}_x64.dmg"
+            hdiutil create -volname "LLM Wiki" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
+            rm -rf "$STAGE"
+          fi
+          echo "Found DMG: $DMG"
+          lipo -info "$(find "$BASE/macos" -name 'llm-wiki' -path '*MacOS*' | head -1)"
+          echo "path=$DMG" >> "$GITHUB_OUTPUT"
+
+      - name: Publish Intel release on this fork
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cat > /tmp/notes.md <<EOF
+          Unofficial Intel macOS build of LLM Wiki ${TAG}.
+
+          Upstream (nashsu/llm_wiki) ships no Intel (x86_64) macOS artifact — its release matrix builds Apple Silicon (aarch64) only. This release fills that gap for Intel Mac users.
+
+          - **Source:** built from unmodified upstream tag ${TAG}.
+          - **Arch:** x86_64-apple-darwin (Intel). Built natively on a macos-13 runner.
+          - **PDFium:** Intel (x86_64) binary swapped in, so PDF import works.
+          - **License:** GPLv3 — Copyright (C) 2024-2026 Yong Su. Redistribution under GPLv3, not an official release.
+
+          ⚠️ **Not code-signed / notarized.** On first launch macOS Gatekeeper will block it. Right-click the app -> Open, or run:
+          \`\`\`
+          xattr -dr com.apple.quarantine "/Applications/LLM Wiki.app"
+          \`\`\`
+
+          🤖 Built by an automated pipeline on this fork.
+          EOF
+          DEST="LLM-Wiki-${TAG}-macOS-Intel-x86_64.dmg"
+          cp "${{ steps.dmg.outputs.path }}" "/tmp/${DEST}"
+          gh release create "${TAG}-intel" \
+            --repo "${{ github.repository }}" \
+            --target main \
+            --title "LLM Wiki ${TAG} — macOS Intel (x86_64) [unofficial]" \
+            --notes-file /tmp/notes.md \
+            "/tmp/${DEST}"
