@@ -60,7 +60,11 @@ jobs:
   build-intel:
     needs: resolve-tag
     if: needs.resolve-tag.outputs.needed == 'true'
-    runs-on: macos-13
+    # GitHub retired the macos-13 hosted runner (jobs queue forever and
+    # never get scheduled), and arm64->x86_64 cross-compile is blocked by
+    # lance-linalg (AVX-512). So we build natively on a self-hosted Intel
+    # Mac registered to this fork (label: intel-imac).
+    runs-on: [self-hosted, intel-imac]
     env:
       TAG: ${{ needs.resolve-tag.outputs.tag }}
     steps:
