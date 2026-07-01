@@ -100,8 +100,20 @@ jobs:
       # .app links the correct PDFium, or PDF features crash at runtime.
       - name: Use x86_64 PDFium binary
         run: |
+          set -euo pipefail
+          # Old tags (v0.4.24 / v0.4.25) predate the committed Intel
+          # PDFium binary — it was added at v0.4.26. The arm64 dylib is
+          # byte-identical from v0.4.24 through v0.5.4 (same PDFium
+          # version), so v0.4.26's libpdfium-x86_64.dylib is the exact
+          # Intel counterpart. Fetch it when this tag lacks it.
+          if [ ! -f src-tauri/pdfium/libpdfium-x86_64.dylib ]; then
+            echo "Intel PDFium missing at this tag; fetching from v0.4.26"
+            curl -fsSL -o src-tauri/pdfium/libpdfium-x86_64.dylib \
+              https://github.com/nashsu/llm_wiki/raw/v0.4.26/src-tauri/pdfium/libpdfium-x86_64.dylib
+          fi
           cp src-tauri/pdfium/libpdfium-x86_64.dylib src-tauri/pdfium/libpdfium.dylib
           file src-tauri/pdfium/libpdfium.dylib
+          lipo -info src-tauri/pdfium/libpdfium.dylib
 
       - name: Build Tauri app (Intel)
         run: npx tauri build --target x86_64-apple-darwin
